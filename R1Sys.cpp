@@ -124,134 +124,121 @@ bool isIdentifier(const std::string& s) {
     return true;
 }
 
-// 前向声明（所有互相调用的函数）
 void runCode(const std::string& input);
 void runLines(const std::vector<std::string>& lines);
 std::string callFunc(const std::string& name, const std::vector<std::string>& args);
-std::string resolveValue(const std::string& raw);
-std::string resolveExprWithFuncs(const std::string& expr);
 
-// 解析表达式中的嵌套函数调用
-std::string resolveExprWithFuncs(const std::string& expr) {
-    std::string result = expr;
-    size_t pos = result.size();
-    while (pos > 0) {
-        pos--;
-        if (result[pos] == ')') {
-            int depth = 1;
-            size_t left = pos;
-            while (left > 0 && depth > 0) {
-                left--;
-                if (result[left] == ')') depth++;
-                else if (result[left] == '(') depth--;
+std::string evalExpr(const std::string& expr) {
+    std::string s = expr;
+    while (!s.empty() && s[0] == ' ') s.erase(0, 1);
+    while (!s.empty() && s.back() == ' ') s.pop_back();
+    if (s.empty()) return "0";
+
+    if ((s[0] == '"' || s[0] == '\'') && s.back() == s[0] && s.size() >= 2)
+        return s.substr(1, s.size() - 2);
+
+    if (hasVar(s) && s.find_first_of("+-*/ ()") == std::string::npos)
+        return getVar(s);
+
+    if (s.find_first_not_of("0123456789.-") == std::string::npos)
+        return s;
+
+    if ((s.find('"') != std::string::npos || s.find('\'') != std::string::npos) && s.find('+') != std::string::npos) {
+        std::string r;
+        size_t i = 0;
+        while (i < s.size()) {
+            while (i < s.size() && s[i] == ' ') i++;
+            if (i >= s.size()) break;
+            if (s[i] == '"' || s[i] == '\'') {
+                char q = s[i]; i++;
+                while (i < s.size() && s[i] != q) { r += s[i]; i++; }
+                if (i < s.size()) i++;
+            } else if (s[i] == '+') { i++; }
+            else {
+                std::string tok;
+                while (i < s.size() && s[i] != ' ' && s[i] != '+' && s[i] != '"' && s[i] != '\'' && s[i] != ')')
+                    { tok += s[i]; i++; }
+                if (!tok.empty()) r += hasVar(tok) ? getVar(tok) : tok;
             }
-            if (depth != 0) continue;
-            
-            size_t funcEnd = left;
-            size_t funcStart = left;
-            while (funcStart > 0 && (isalnum(result[funcStart-1]) || result[funcStart-1] == '_')) funcStart--;
-            
-            std::string funcName = result.substr(funcStart, funcEnd - funcStart);
-            
-            if (g_funcs.find(funcName) != g_funcs.end()) {
-                std::string argsStr = result.substr(left + 1, pos - left - 1);
+        }
+        return r;
+    }
+
+    // 处理自定义函数调用 - 只替换最内层
+    size_t rp = s.rfind(')');
+    if (rp != std::string::npos) {
+        int depth = 1;
+        size_t lp = rp;
+        while (lp > 0 && depth > 0) {
+            lp--;
+            if (s[lp] == ')') depth++;
+            else if (s[lp] == '(') depth--;
+        }
+        if (depth == 0) {
+            size_t fs = lp;
+            while (fs > 0 && (isalnum(s[fs-1]) || s[fs-1] == '_')) fs--;
+            std::string fn = s.substr(fs, lp - fs);
+
+            if (g_funcs.find(fn) != g_funcs.end()) {
+                std::string argsStr = s.substr(lp + 1, rp - lp - 1);
                 std::vector<std::string> cargs;
                 size_t ap = 0;
                 while (ap < argsStr.size()) {
-                    std::string arg = getArg(argsStr, ap);
-                    cargs.push_back(resolveExprWithFuncs(arg));
+                    cargs.push_back(evalExpr(getArg(argsStr, ap)));
                     if (ap < argsStr.size() && argsStr[ap] == ',') ap++;
                 }
-                for (size_t i = 0; i < cargs.size(); i++) {
-                    if (isIdentifier(cargs[i]) && !hasVar(cargs[i])) continue;
-                    if ((cargs[i][0]=='\''||cargs[i][0]=='"') && cargs[i].back()==cargs[i][0]) continue;
-                    cargs[i] = resolveValue(cargs[i]);
-                }
-                std::string funcResult = callFunc(funcName, cargs);
-                result.replace(funcStart, pos - funcStart + 1, funcResult);
-                pos = funcStart + funcResult.size();
+                std::string fr = callFunc(fn, cargs);
+                s.replace(fs, rp - fs + 1, fr);
+                return evalExpr(s);
             }
         }
     }
-    return result;
-}
 
-std::string resolveValue(const std::string& raw) {
-    if (raw.empty()) return "";
-    if ((raw[0]=='"'||raw[0]=='\'') && raw.back()==raw[0] && raw.size()>=2)
-        return raw.substr(1, raw.size()-2);
-    if (hasVar(raw) && raw.find_first_of("+-*/ ()'\"")==std::string::npos)
-        return getVar(raw);
-    bool hasQ = (raw.find('"')!=std::string::npos || raw.find('\'')!=std::string::npos);
-    bool hasP = (raw.find('+')!=std::string::npos);
-    if (hasQ && hasP) {
-        std::string result;
-        size_t i = 0;
-        while (i < raw.size()) {
-            while (i < raw.size() && raw[i]==' ') i++;
-            if (i >= raw.size()) break;
-            if (raw[i]=='"' || raw[i]=='\'') {
-                char q = raw[i]; i++;
-                while (i < raw.size() && raw[i]!=q) { result+=raw[i]; i++; }
-                if (i < raw.size()) i++;
-            }
-            else if (raw[i]=='+' || raw[i]==',') { i++; }
-            else {
-                std::string tok;
-                while (i < raw.size() && raw[i]!=' ' && raw[i]!='+' && raw[i]!=',' &&
-                       raw[i]!='"' && raw[i]!='\'' && raw[i]!=')') { tok+=raw[i]; i++; }
-                if (!tok.empty()) {
-                    if (hasVar(tok)) result+=getVar(tok);
-                    else result+=tok;
-                }
-            }
-        }
-        return result;
-    }
-    if (raw.find('(') != std::string::npos && raw.find(')') != std::string::npos) {
-        return resolveExprWithFuncs(raw);
-    }
-    if (hasVar(raw)) return getVar(raw);
     try {
-        double val = calc(raw);
+        double val = calc(s);
         char buf[64];
-        if (val==(int)val) sprintf(buf,"%d",(int)val);
-        else sprintf(buf,"%g",val);
+        if (val == (int)val) sprintf(buf, "%d", (int)val);
+        else sprintf(buf, "%g", val);
         return buf;
-    } catch (...) { return raw; }
+    } catch (...) { return s; }
 }
 
 std::string resolveFuncArg(const std::string& raw) {
     if (raw.empty()) return "";
-    if ((raw[0]=='\''||raw[0]=='"') && raw.back()==raw[0])
-        return raw.substr(1, raw.size()-2);
+    if ((raw[0] == '\'' || raw[0] == '"') && raw.back() == raw[0])
+        return raw.substr(1, raw.size() - 2);
     if (isIdentifier(raw) && !hasVar(raw))
         return raw;
-    return resolveValue(raw);
+    return evalExpr(raw);
 }
 
 std::string callFunc(const std::string& name, const std::vector<std::string>& args) {
     auto it = g_funcs.find(name);
     if (it == g_funcs.end()) return "";
-    
+
     Function& f = it->second;
     std::map<std::string, std::string> savedVars;
-    
+
     for (size_t i = 0; i < f.params.size() && i < args.size(); i++) {
         if (hasVar(f.params[i])) savedVars[f.params[i]] = getVar(f.params[i]);
         setVar(f.params[i], args[i]);
     }
-    
-    if (hasVar("__ret__")) savedVars["__ret__"] = getVar("__ret__");
+
+    std::string savedRet;
+    if (hasVar("__ret__")) savedRet = getVar("__ret__");
     setVar("__ret__", "");
-    
+
+    bool savedReturning = g_returning;
     g_returning = false;
+
     runLines(f.body);
-    g_returning = false;
-    
+
+    g_returning = savedReturning;
     std::string ret = getVar("__ret__");
+
     for (auto& sv : savedVars) setVar(sv.first, sv.second);
-    
+    if (!savedRet.empty()) setVar("__ret__", savedRet);
+
     return ret;
 }
 
@@ -260,7 +247,7 @@ void runCode(const std::string& input) {
     while (!s.empty() && s[0]==' ') s.erase(0,1);
     while (!s.empty() && s.back()==' ') s.pop_back();
     if (s.empty() || s[0]=='#') return;
-    
+
     if (s.find("return ")==0) {
         std::string val = s.substr(7);
         while (!val.empty() && val[0]==' ') val.erase(0,1);
@@ -268,29 +255,27 @@ void runCode(const std::string& input) {
         g_returning = true;
         return;
     }
-    
+
     size_t p = s.find('(');
     size_t eq = s.find('=');
-    
+
     if (eq!=std::string::npos && eq>0 && !(eq+1<s.size()&&s[eq+1]=='=') &&
         !(eq>0&&(s[eq-1]=='!'||s[eq-1]=='<'||s[eq-1]=='>')) &&
         !(eq>0&&(s[eq-1]=='+'||s[eq-1]=='-'||s[eq-1]=='*'||s[eq-1]=='/')) &&
         (p==std::string::npos || eq<p)) {
-        
         std::string vn=s.substr(0,eq), vl=s.substr(eq+1);
         while (!vn.empty()&&vn.back()==' ') vn.pop_back();
         while (!vl.empty()&&vl[0]==' ') vl.erase(0,1);
         while (!vl.empty()&&vl.back()==' ') vl.pop_back();
         if (vn.empty()||vl.empty()) return;
-        
         setVar(vn, resolveFuncArg(vl));
         return;
     }
-    
+
     if (p!=std::string::npos && s.back()==')') {
         std::string fn=s.substr(0,p);
         while (!fn.empty()&&fn.back()==' ') fn.pop_back();
-        
+
         if (g_funcs.find(fn)!=g_funcs.end()) {
             std::vector<std::string> args;
             size_t pos=p+1;
@@ -301,32 +286,40 @@ void runCode(const std::string& input) {
             callFunc(fn, args);
             return;
         }
-        
+
         if (fn=="PrintLog") {
             std::string inner=s.substr(p+1);
             if (!inner.empty()&&inner.back()==')') inner.pop_back();
-            Log(resolveValue(inner));
+            Log(evalExpr(inner));
             return;
         }
-        
+
+        // 提取原始参数
         std::vector<std::string> rawArgs;
         size_t pos=p+1;
         while (pos<s.size()&&s[pos]!=')') {
             rawArgs.push_back(getArg(s,pos));
             if (pos<s.size()&&s[pos]==',') pos++;
         }
-        if (fn=="box") { if (rawArgs.size()>=2) setVar(rawArgs[0],resolveFuncArg(rawArgs[1])); return; }
-        if (fn=="boxS") { if (rawArgs.size()>=3) setVar(rawArgs[1],resolveFuncArg(rawArgs[2])); return; }
+
+        if (fn=="box") { if (rawArgs.size()>=2) setVar(rawArgs[0],evalExpr(rawArgs[1])); return; }
+        if (fn=="boxS") { if (rawArgs.size()>=3) setVar(rawArgs[1],evalExpr(rawArgs[2])); return; }
         if (fn=="Input") {
             g_waitingInput=true; g_inputType=0;
-            g_inputPrompt=rawArgs.size()>0?resolveFuncArg(rawArgs[0]):"";
-            g_inputVarName=rawArgs.size()>1?rawArgs[1]:"";
+            g_inputPrompt=rawArgs.size()>0 ? rawArgs[0] : "";
+            g_inputVarName=rawArgs.size()>1 ? rawArgs[1] : "";
             Log(g_inputPrompt); return;
         }
         if (fn=="InputInt") {
             g_waitingInput=true; g_inputType=1;
-            g_inputPrompt=rawArgs.size()>0?resolveFuncArg(rawArgs[0]):"";
-            g_inputVarName=rawArgs.size()>1?rawArgs[1]:"";
+            g_inputPrompt=rawArgs.size()>0 ? rawArgs[0] : "";
+            g_inputVarName=rawArgs.size()>1 ? rawArgs[1] : "";
+            Log(g_inputPrompt); return;
+        }
+        if (fn=="InputBool") {
+            g_waitingInput=true; g_inputType=3;
+            g_inputPrompt=rawArgs.size()>0 ? rawArgs[0] + " (y/n)" : "(y/n)";
+            g_inputVarName=rawArgs.size()>1 ? rawArgs[1] : "";
             Log(g_inputPrompt); return;
         }
         if (fn=="showAllBoxes") { for (auto& v:g_vars) Log("  "+v.first+" = "+v.second); return; }
@@ -335,7 +328,7 @@ void runCode(const std::string& input) {
         Log("? "+fn);
         return;
     }
-    
+
     std::string ops[]={"+=","-=","*=","/="};
     for (int j=0;j<4;j++) {
         size_t op=s.find(ops[j]);
@@ -352,7 +345,7 @@ void runCode(const std::string& input) {
             }
         }
     }
-    
+
     Log("? "+s);
 }
 
@@ -364,7 +357,7 @@ void runLines(const std::vector<std::string>& lines) {
         while (!s.empty()&&s[0]==' ') s.erase(0,1);
         while (!s.empty()&&s.back()==' ') s.pop_back();
         if (s.empty()||s[0]=='#') continue;
-        
+
         if (s.find("Func(")==0) {
             size_t p1=s.find('('), p2=s.find_last_of(')');
             if (p1==std::string::npos||p2==std::string::npos) continue;
@@ -394,7 +387,7 @@ void runLines(const std::vector<std::string>& lines) {
             Log("[Func] "+func.name+" ("+std::to_string(func.params.size())+" params)");
             continue;
         }
-        
+
         if (s.find("if(")==0) {
             size_t p1=s.find('('), p2=s.find_last_of(')');
             if (p1==std::string::npos||p2==std::string::npos) continue;
@@ -427,7 +420,7 @@ void runLines(const std::vector<std::string>& lines) {
             else if (!eb.empty()) { bool sv=g_returning; g_returning=false; runLines(eb); g_returning=sv; }
             continue;
         }
-        
+
         if (s.find("For(")==0) {
             size_t p1=s.find('('), p2=s.find_last_of(')');
             if (p1==std::string::npos||p2==std::string::npos) continue;
@@ -467,7 +460,7 @@ void runLines(const std::vector<std::string>& lines) {
             }
             continue;
         }
-        
+
         if (s.find("while(")==0) {
             size_t p1=s.find('('), p2=s.find_last_of(')');
             if (p1==std::string::npos||p2==std::string::npos) continue;
@@ -493,7 +486,7 @@ void runLines(const std::vector<std::string>& lines) {
             }
             continue;
         }
-        
+
         runCode(s);
         if (g_returning) break;
     }
