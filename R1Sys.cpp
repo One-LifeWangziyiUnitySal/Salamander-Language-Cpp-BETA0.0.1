@@ -13,6 +13,7 @@ bool g_waitingInput = false;
 std::string g_inputPrompt, g_inputVarName;
 int g_inputType = 0;
 bool g_returning = false;
+bool g_runningAll = false;  // 是否在运行全部
 
 void guiOutput(const std::string& text) {
     if (!g_hOutput) return;
@@ -164,7 +165,6 @@ std::string evalExpr(const std::string& expr) {
         return r;
     }
 
-    // 处理自定义函数调用 - 只替换最内层
     size_t rp = s.rfind(')');
     if (rp != std::string::npos) {
         int depth = 1;
@@ -178,7 +178,6 @@ std::string evalExpr(const std::string& expr) {
             size_t fs = lp;
             while (fs > 0 && (isalnum(s[fs-1]) || s[fs-1] == '_')) fs--;
             std::string fn = s.substr(fs, lp - fs);
-
             if (g_funcs.find(fn) != g_funcs.end()) {
                 std::string argsStr = s.substr(lp + 1, rp - lp - 1);
                 std::vector<std::string> cargs;
@@ -215,30 +214,22 @@ std::string resolveFuncArg(const std::string& raw) {
 std::string callFunc(const std::string& name, const std::vector<std::string>& args) {
     auto it = g_funcs.find(name);
     if (it == g_funcs.end()) return "";
-
     Function& f = it->second;
     std::map<std::string, std::string> savedVars;
-
     for (size_t i = 0; i < f.params.size() && i < args.size(); i++) {
         if (hasVar(f.params[i])) savedVars[f.params[i]] = getVar(f.params[i]);
         setVar(f.params[i], args[i]);
     }
-
     std::string savedRet;
     if (hasVar("__ret__")) savedRet = getVar("__ret__");
     setVar("__ret__", "");
-
     bool savedReturning = g_returning;
     g_returning = false;
-
     runLines(f.body);
-
     g_returning = savedReturning;
     std::string ret = getVar("__ret__");
-
     for (auto& sv : savedVars) setVar(sv.first, sv.second);
     if (!savedRet.empty()) setVar("__ret__", savedRet);
-
     return ret;
 }
 
@@ -276,7 +267,6 @@ void runCode(const std::string& input) {
         std::string fn=s.substr(0,p);
         while (!fn.empty()&&fn.back()==' ') fn.pop_back();
 
-        // 提取原始参数
         std::vector<std::string> rawArgs;
         size_t pos=p+1;
         while (pos<s.size()&&s[pos]!=')') {
@@ -284,7 +274,6 @@ void runCode(const std::string& input) {
             if (pos<s.size()&&s[pos]==',') pos++;
         }
 
-        // 自定义函数
         if (g_funcs.find(fn)!=g_funcs.end()) {
             std::vector<std::string> args;
             for (size_t i=0;i<rawArgs.size();i++) args.push_back(resolveFuncArg(rawArgs[i]));
@@ -292,7 +281,6 @@ void runCode(const std::string& input) {
             return;
         }
 
-        // PrintLog
         if (fn=="PrintLog") {
             std::string inner=s.substr(p+1);
             if (!inner.empty()&&inner.back()==')') inner.pop_back();
@@ -300,7 +288,6 @@ void runCode(const std::string& input) {
             return;
         }
 
-        // box - 检查第三个参数是否是Input()
         if (fn=="box") {
             if (rawArgs.size()>=2) {
                 std::string val = rawArgs[1];
@@ -316,7 +303,6 @@ void runCode(const std::string& input) {
             return;
         }
 
-        // boxS - 检查第三个参数是否是Input()
         if (fn=="boxS") {
             if (rawArgs.size()>=3) {
                 std::string val = rawArgs[2];
@@ -332,7 +318,6 @@ void runCode(const std::string& input) {
             return;
         }
 
-        // Input
         if (fn=="Input") {
             g_waitingInput=true; g_inputType=0;
             g_inputPrompt=rawArgs.size()>0 ? rawArgs[0] : "";
@@ -376,6 +361,24 @@ void runCode(const std::string& input) {
     }
 
     Log("? "+s);
+}
+
+// 继续执行多行代码
+void continueRunLines() {
+    if (!g_runningAll) return;
+    while (g_currentLine < (int)g_multiLines.size()) {
+        if (g_waitingInput) return;  // 暂停等待输入
+        if (g_returning) { g_returning = false; break; }
+        std::string s = g_multiLines[g_currentLine];
+        g_currentLine++;
+        runCode(s);
+    }
+    if (g_currentLine >= (int)g_multiLines.size() && !g_waitingInput) {
+        Log("=== 完毕 ===");
+        g_multiLines.clear();
+        g_currentLine = 0;
+        g_runningAll = false;
+    }
 }
 
 void runLines(const std::vector<std::string>& lines) {
@@ -553,43 +556,106 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         case WM_COMMAND: {
             if (LOWORD(wParam)==3) {
+                // 运行按钮
                 if (g_waitingInput) {
-                    char buf[1024]; GetWindowText(g_hInput,buf,1024);
-                    if (strlen(buf)>0) { Log(g_inputPrompt+buf); if (!g_inputVarName.empty()) setVar(g_inputVarName,buf); g_waitingInput=false; SetWindowText(g_hInput,""); }
+                    // 等待输入状态下点击运行 → 提交输入
+                    char buf[1024]; GetWindowText(g_hInput, buf, 1024);
+                    if (strlen(buf) > 0) {
+                        Log(g_inputPrompt + buf);
+                        if (!g_inputVarName.empty()) setVar(g_inputVarName, buf);
+                        g_waitingInput = false;
+                        SetWindowText(g_hInput, "");
+                        SetWindowText(g_hRunBtn, "运行");
+                        SetWindowText(g_hStepBtn, "逐行");
+                        // 继续执行多行代码
+                        continueRunLines();
+                    }
                 } else if (g_multiLineMode) {
-                    char buf[65536]; GetWindowText(g_hMultiEdit,buf,65536);
-                    std::string t(buf); std::vector<std::string> ls; std::istringstream iss(t); std::string l;
-                    while (std::getline(iss,l)) { while(!l.empty()&&(l.back()=='\r'||l.back()=='\n')) l.pop_back(); ls.push_back(l); }
-                    Log("=== 运行 ("+std::to_string(ls.size())+"行) ===");
-                    runLines(ls); Log("=== 完毕 ===");
+                    // 多行模式 → 加载并运行全部
+                    char buf[65536]; GetWindowText(g_hMultiEdit, buf, 65536);
+                    std::string t(buf);
+                    g_multiLines.clear();
+                    g_currentLine = 0;
+                    std::istringstream iss(t);
+                    std::string l;
+                    while (std::getline(iss, l)) {
+                        while (!l.empty() && (l.back()=='\r' || l.back()=='\n')) l.pop_back();
+                        g_multiLines.push_back(l);
+                    }
+                    if (g_multiLines.empty()) { Log("编辑器为空"); break; }
+                    g_runningAll = true;
+                    Log("=== 运行 (" + std::to_string(g_multiLines.size()) + "行) ===");
+                    continueRunLines();
+                    if (!g_waitingInput && g_currentLine >= (int)g_multiLines.size()) {
+                        g_runningAll = false;
+                    }
                 } else {
-                    char buf[1024]; GetWindowText(g_hInput,buf,1024);
-                    if (strlen(buf)>0) { runCode(buf); SetWindowText(g_hInput,""); }
+                    // 单行模式
+                    char buf[1024]; GetWindowText(g_hInput, buf, 1024);
+                    if (strlen(buf) > 0) { runCode(buf); SetWindowText(g_hInput, ""); }
                 }
             }
-            if (LOWORD(wParam)==4) SetWindowText(g_hOutput,"");
+            if (LOWORD(wParam)==4) SetWindowText(g_hOutput, "");
             if (LOWORD(wParam)==6) {
-                if (!g_multiLineMode) break;
-                if (g_multiLines.empty()) {
-                    char buf[65536]; GetWindowText(g_hMultiEdit,buf,65536);
-                    std::string t(buf); std::istringstream iss(t); std::string l;
-                    while (std::getline(iss,l)) { while(!l.empty()&&(l.back()=='\r'||l.back()=='\n')) l.pop_back(); g_multiLines.push_back(l); }
-                    g_currentLine=0;
+                // 逐行按钮
+                if (g_waitingInput) {
+                    // 等待输入 → 提交输入并继续
+                    char buf[1024]; GetWindowText(g_hInput, buf, 1024);
+                    if (strlen(buf) > 0) {
+                        Log(g_inputPrompt + buf);
+                        if (!g_inputVarName.empty()) setVar(g_inputVarName, buf);
+                        g_waitingInput = false;
+                        SetWindowText(g_hInput, "");
+                        SetWindowText(g_hRunBtn, "运行");
+                        SetWindowText(g_hStepBtn, "逐行");
+                        continueRunLines();
+                    }
+                    break;
                 }
-                if (g_currentLine<(int)g_multiLines.size()) { runCode(g_multiLines[g_currentLine]); g_currentLine++; }
-                if (g_currentLine>=(int)g_multiLines.size()) { Log("=== 逐行完毕 ==="); g_multiLines.clear(); g_currentLine=0; }
+                if (!g_multiLineMode) break;
+                if (g_multiLines.empty() || g_currentLine == 0) {
+                    char buf[65536]; GetWindowText(g_hMultiEdit, buf, 65536);
+                    std::string t(buf);
+                    g_multiLines.clear();
+                    g_currentLine = 0;
+                    std::istringstream iss(t);
+                    std::string l;
+                    while (std::getline(iss, l)) {
+                        while (!l.empty() && (l.back()=='\r' || l.back()=='\n')) l.pop_back();
+                        g_multiLines.push_back(l);
+                    }
+                }
+                if (g_currentLine < (int)g_multiLines.size()) {
+                    g_runningAll = true;
+                    std::string s = g_multiLines[g_currentLine];
+                    g_currentLine++;
+                    Log("> [" + std::to_string(g_currentLine) + "/" + std::to_string(g_multiLines.size()) + "] " + s);
+                    runCode(s);
+                    if (g_currentLine >= (int)g_multiLines.size() && !g_waitingInput) {
+                        Log("=== 逐行完毕 ===");
+                        g_multiLines.clear();
+                        g_currentLine = 0;
+                        g_runningAll = false;
+                        SetWindowText(g_hStepBtn, "逐行");
+                    }
+                    if (g_currentLine < (int)g_multiLines.size() && !g_waitingInput) {
+                        std::ostringstream oss;
+                        oss << "逐行(" << (g_currentLine + 1) << "/" << g_multiLines.size() << ")";
+                        SetWindowText(g_hStepBtn, oss.str().c_str());
+                    }
+                }
             }
             if (LOWORD(wParam)==7) {
                 g_multiLineMode=!g_multiLineMode;
-                ShowWindow(g_hInput,g_multiLineMode?SW_HIDE:SW_SHOW);
-                ShowWindow(g_hMultiEdit,g_multiLineMode?SW_SHOW:SW_HIDE);
-                SetWindowText(g_hSwitchBtn,g_multiLineMode?"单行":"多行");
+                ShowWindow(g_hInput, g_multiLineMode ? SW_HIDE : SW_SHOW);
+                ShowWindow(g_hMultiEdit, g_multiLineMode ? SW_SHOW : SW_HIDE);
+                SetWindowText(g_hSwitchBtn, g_multiLineMode ? "单行" : "多行");
             }
             break;
         }
         case WM_DESTROY: PostQuitMessage(0); break;
     }
-    return DefWindowProc(hWnd,msg,wParam,lParam);
+    return DefWindowProc(hWnd, msg, wParam, lParam);
 }
 
 int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR, int nCS) {
