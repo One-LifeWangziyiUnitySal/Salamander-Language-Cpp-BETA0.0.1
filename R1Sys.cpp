@@ -276,24 +276,6 @@ void runCode(const std::string& input) {
         std::string fn=s.substr(0,p);
         while (!fn.empty()&&fn.back()==' ') fn.pop_back();
 
-        if (g_funcs.find(fn)!=g_funcs.end()) {
-            std::vector<std::string> args;
-            size_t pos=p+1;
-            while (pos<s.size()&&s[pos]!=')') {
-                args.push_back(resolveFuncArg(getArg(s,pos)));
-                if (pos<s.size()&&s[pos]==',') pos++;
-            }
-            callFunc(fn, args);
-            return;
-        }
-
-        if (fn=="PrintLog") {
-            std::string inner=s.substr(p+1);
-            if (!inner.empty()&&inner.back()==')') inner.pop_back();
-            Log(evalExpr(inner));
-            return;
-        }
-
         // 提取原始参数
         std::vector<std::string> rawArgs;
         size_t pos=p+1;
@@ -302,8 +284,55 @@ void runCode(const std::string& input) {
             if (pos<s.size()&&s[pos]==',') pos++;
         }
 
-        if (fn=="box") { if (rawArgs.size()>=2) setVar(rawArgs[0],evalExpr(rawArgs[1])); return; }
-        if (fn=="boxS") { if (rawArgs.size()>=3) setVar(rawArgs[1],evalExpr(rawArgs[2])); return; }
+        // 自定义函数
+        if (g_funcs.find(fn)!=g_funcs.end()) {
+            std::vector<std::string> args;
+            for (size_t i=0;i<rawArgs.size();i++) args.push_back(resolveFuncArg(rawArgs[i]));
+            callFunc(fn, args);
+            return;
+        }
+
+        // PrintLog
+        if (fn=="PrintLog") {
+            std::string inner=s.substr(p+1);
+            if (!inner.empty()&&inner.back()==')') inner.pop_back();
+            Log(evalExpr(inner));
+            return;
+        }
+
+        // box - 检查第三个参数是否是Input()
+        if (fn=="box") {
+            if (rawArgs.size()>=2) {
+                std::string val = rawArgs[1];
+                if (val.find("Input(")==0 && val.back()==')') {
+                    g_waitingInput=true; g_inputType=0;
+                    g_inputVarName=rawArgs[0];
+                    g_inputPrompt="";
+                    Log(g_inputPrompt);
+                    return;
+                }
+                setVar(rawArgs[0], evalExpr(val));
+            }
+            return;
+        }
+
+        // boxS - 检查第三个参数是否是Input()
+        if (fn=="boxS") {
+            if (rawArgs.size()>=3) {
+                std::string val = rawArgs[2];
+                if (val.find("Input(")==0 && val.back()==')') {
+                    g_waitingInput=true; g_inputType=0;
+                    g_inputVarName=rawArgs[1];
+                    g_inputPrompt="";
+                    Log(g_inputPrompt);
+                    return;
+                }
+                setVar(rawArgs[1], evalExpr(val));
+            }
+            return;
+        }
+
+        // Input
         if (fn=="Input") {
             g_waitingInput=true; g_inputType=0;
             g_inputPrompt=rawArgs.size()>0 ? rawArgs[0] : "";
@@ -318,7 +347,7 @@ void runCode(const std::string& input) {
         }
         if (fn=="InputBool") {
             g_waitingInput=true; g_inputType=3;
-            g_inputPrompt=rawArgs.size()>0 ? rawArgs[0] + " (y/n)" : "(y/n)";
+            g_inputPrompt=rawArgs.size()>0 ? rawArgs[0]+" (y/n)" : "(y/n)";
             g_inputVarName=rawArgs.size()>1 ? rawArgs[1] : "";
             Log(g_inputPrompt); return;
         }
