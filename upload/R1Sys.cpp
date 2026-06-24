@@ -18,6 +18,29 @@ HWND g_hMainWnd, g_hMultiEdit;
 // 输出窗口控件 (独立弹出窗口)
 HWND g_hOutputWnd, g_hOutput, g_hInput, g_hSendBtn;
 
+// 多线程支持
+HANDLE g_hRunThread = NULL;
+bool g_isRunning = false;      // 是否正在运行
+CRITICAL_SECTION g_cs;          // 线程同步锁
+bool g_csInited = false;
+
+// 线程安全的标志访问
+void setRunning(bool v) {
+    if (g_csInited) EnterCriticalSection(&g_cs);
+    g_isRunning = v;
+    if (g_csInited) LeaveCriticalSection(&g_cs);
+}
+bool isRunning() {
+    bool v;
+    if (g_csInited) EnterCriticalSection(&g_cs);
+    v = g_isRunning;
+    if (g_csInited) LeaveCriticalSection(&g_cs);
+    return v;
+}
+
+// 自定义消息: 运行完成通知主线程
+#define WM_APP_RUNDONE (WM_APP + 10)
+
 // 当前字体
 HFONT g_hEditorFont = NULL;
 int g_fontSize = 15;
@@ -59,6 +82,36 @@ bool g_returning = false;
 bool g_breakLoop = false;
 bool g_inTryBlock = false;  // 是否在 try 块中
 
+// ---- 多线程支持 (用户脚本层面) ----
+// 用户脚本可以通过 Thread() ... endThread 创建线程
+CRITICAL_SECTION g_scriptCS;           // 脚本线程同步锁
+bool g_scriptCSInited = false;
+std::vector<HANDLE> g_scriptThreads;    // 用户创建的线程句柄
+volatile long g_threadCount = 0;        // 活跃线程计数 (InterlockedIncrement)
+
+// 线程参数: 保存要执行的代码行和线程ID
+struct ThreadArg {
+    std::vector<std::string> lines;
+    int threadId;
+};
+
+// 线程函数 (runLines 前向声明在后面)
+void runLines(const std::vector<std::string>& lines);
+DWORD WINAPI scriptThreadFunc(LPVOID lpParam) {
+    ThreadArg* arg = (ThreadArg*)lpParam;
+    std::vector<std::string> lines = arg->lines;
+    int tid = arg->threadId;
+    delete arg;
+
+    // 在锁保护下执行 (避免全局变量冲突)
+    EnterCriticalSection(&g_scriptCS);
+    runLines(lines);
+    LeaveCriticalSection(&g_scriptCS);
+
+    InterlockedDecrement(&g_threadCount);
+    return 0;
+}
+
 // ---- 列表系统 ----
 std::map<std::string, std::vector<std::string> > g_lists;
 
@@ -94,7 +147,7 @@ void setConst(const std::string& name, const std::string& v) {
 }
 
 // ---- 字典系统 (Dict) ----
-// 字典存储: 变量名 -> 键值对映射
+// 字典存储: 变量名 -> 键值对映																																				射
 std::map<std::string, std::map<std::string, std::string> > g_dicts;
 
 bool isDictVar(const std::string& name) {
@@ -199,12 +252,10 @@ std::deque<ResumeFrame> g_resumeStack;
 
 void guiOutput(const std::string& text) {
     if (!g_hOutputWnd) return;
-    if (g_hOutput) {
-        // 同步追加到输出框，确保顺序正确
-        int len = GetWindowTextLength(g_hOutput);
-        SendMessage(g_hOutput, EM_SETSEL, len, len);
-        SendMessage(g_hOutput, EM_REPLACESEL, 0, (LPARAM)text.c_str());
-    }
+    // 线程安全: 用 PostMessage 异步发送到输出窗口
+    // 工作线程不能直接操作 UI 控件
+    std::string* p = new std::string(text);
+    PostMessage(g_hOutputWnd, WM_APP_APPENDTEXT, 0, (LPARAM)p);
 }
 
 std::string getTime() {
@@ -218,15 +269,6 @@ std::string getTime() {
 void Log(const std::string& s) { guiOutput("[" + getTime() + "] " + s + "\r\n"); }
 
 // ---- 错误系统 ----
-struct ErrorInfo {
-    int code;
-    std::string message;
-    int line;
-    std::string context;
-};
-std::vector<ErrorInfo> g_errors;
-int g_currentLineNo = 0;
-
 enum ErrorCode {
     ERR_NONE = 0,
     ERR_SYNTAX = 1001,
@@ -246,17 +288,64 @@ enum ErrorCode {
     ERR_INTERNAL = 1099
 };
 
+struct ErrorInfo {
+    int code;
+    std::string message;
+    int line;       // 行号 (1-based)
+    int column;     // 列号 (1-based, 0=未知)
+    std::string context;
+    std::string funcName;  // 所在函数名
+};
+std::vector<ErrorInfo> g_errors;
+int g_currentLineNo = 0;
+int g_currentColumn = 0;        // 当前列号
+std::string g_currentFuncName;  // 当前所在函数名
+
+// 递归深度检测
+int g_callDepth = 0;
+const int MAX_CALL_DEPTH = 200;  // 最大递归深度
+
+// 错误名称映射 (用于友好显示)
+static const char* errorName(int code) {
+    switch (code) {
+        case ERR_SYNTAX: return "SyntaxError";
+        case ERR_UNDEFINED_VAR: return "NameError";
+        case ERR_UNDEFINED_FUNC: return "FuncError";
+        case ERR_INVALID_ARG: return "ArgError";
+        case ERR_ARG_COUNT: return "ArgCountError";
+        case ERR_INVALID_NUM: return "NumError";
+        case ERR_INVALID_STR: return "StrError";
+        case ERR_INVALID_LIST: return "ListError";
+        case ERR_DIV_ZERO: return "DivZeroError";
+        case ERR_OUT_OF_RANGE: return "RangeError";
+        case ERR_INVALID_TYPE: return "TypeError";
+        case ERR_INVALID_NAME: return "NameError";
+        case ERR_FILE_IO: return "IOError";
+        case ERR_STACK_OVERFLOW: return "StackOverflowError";
+        case ERR_INTERNAL: return "InternalError";
+        default: return "Error";
+    }
+}
+
 void clearErrors() { g_errors.clear(); }
 void reportError(int code, const std::string& msg, const std::string& context = "") {
     ErrorInfo e;
     e.code = code;
     e.message = msg;
     e.line = g_currentLineNo;
+    e.column = g_currentColumn;
     e.context = context;
+    e.funcName = g_currentFuncName;
     g_errors.push_back(e);
-    char prefix[128];
-    sprintf(prefix, "[Error E%d L%d] ", code, g_currentLineNo);
-    Log(prefix + msg + (context.empty() ? "" : " (" + context + ")"));
+    // 格式: [Error] FuncName@L行:C列: 错误类型: 消息 (上下文)
+    char prefix[256];
+    const char* ename = errorName(code);
+    if (g_currentFuncName.empty()) {
+        sprintf(prefix, "[Error] L%d:C%d %s: ", g_currentLineNo, g_currentColumn, ename);
+    } else {
+        sprintf(prefix, "[Error] %s@L%d:C%d %s: ", g_currentFuncName.c_str(), g_currentLineNo, g_currentColumn, ename);
+    }
+    Log(std::string(prefix) + msg + (context.empty() ? "" : " | " + context));
     // 在 try 块中出错,设置中断标志
     if (g_inTryBlock) g_breakLoop = true;
 }
@@ -265,11 +354,34 @@ void printAllErrors() {
     if (g_errors.empty()) return;
     Log("=== Error Summary (" + std::to_string(g_errors.size()) + " errors) ===");
     for (auto& e : g_errors) {
-        char buf[256];
-        sprintf(buf, "  E%d L%d: ", e.code, e.line);
-        Log(buf + e.message + (e.context.empty() ? "" : " | " + e.context));
+        char buf[512];
+        const char* ename = errorName(e.code);
+        if (e.funcName.empty()) {
+            sprintf(buf, "  E%d %s L%d:C%d: ", e.code, ename, e.line, e.column);
+        } else {
+            sprintf(buf, "  E%d %s %s@L%d:C%d: ", e.code, ename, e.funcName.c_str(), e.line, e.column);
+        }
+        Log(std::string(buf) + e.message + (e.context.empty() ? "" : " | " + e.context));
     }
 }
+
+// ---- 内存管理 / GC (实现在所有全局变量之后) ----
+struct MemStats {
+    size_t vars = 0;
+    size_t lists = 0;
+    size_t dicts = 0;
+    size_t consts = 0;
+    size_t funcs = 0;
+    size_t nativeFuncs = 0;
+    size_t loadedDlls = 0;
+    size_t loadedPacks = 0;
+    size_t pendingFrames = 0;
+    size_t resumeStack = 0;
+    size_t errors = 0;
+    size_t total() const { return vars+lists+dicts+consts+funcs+nativeFuncs+loadedDlls+loadedPacks+pendingFrames+resumeStack+errors; }
+};
+MemStats getMemStats();
+std::string gc(int mode = 0);
 
 // loadPack 实现 (在错误系统之后)
 bool loadPack(const std::string& name) {
@@ -430,7 +542,9 @@ bool loadCPack(const std::string& name) {
     return true;
 }
 
-// ---- ±äÁ¿¹ÜÀí ----
+// ---- getMemStats / gc 实现在变量定义之后 ----
+
+// ---- ±?á?1üàí ----
 
 std::map<std::string, std::string> g_vars;
 void setVar(const std::string& n, const std::string& v) {
@@ -455,7 +569,7 @@ bool eraseVar(const std::string& n) {
     return g_vars.erase(n) > 0;
 }
 
-// ---- È¥¿Õ°× ----
+// ---- è￥??°× ----
 static inline void trimLeft(std::string& s) {
     size_t i = 0;
     while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) i++;
@@ -468,7 +582,7 @@ static inline void trimRight(std::string& s) {
 }
 static inline void trim(std::string& s) { trimLeft(s); trimRight(s); }
 
-// ---- isIdentifier: Ö§³ÖÊ××ÖÄ¸ÏÂ»®Ïß£¬ºóÐø¿Éº¬Êý×Ö ----
+// ---- isIdentifier: ?§3?ê××?????????￡?oóD??éo?êy×? ----
 bool isIdentifier(const std::string& s) {
     if (s.empty()) return false;
     unsigned char c0 = (unsigned char)s[0];
@@ -501,7 +615,7 @@ bool isListIndexExpr(const std::string& s, std::string& listName, std::string& i
     return isIdentifier(listName);
 }
 
-// ÊÇ·ñÊÇ´¿Êý×Ö£¨°üÀ¨Ð¡Êý¡¢¸ººÅ¡¢¿ÆÑ§¼ÆÊý·¨£©
+// ê?·?ê?′?êy×?￡¨°üà¨D?êy?￠?oo??￠???§??êy·¨￡?
 bool isPureNumber(const std::string& s) {
     if (s.empty()) return false;
     bool hasDigit = false;
@@ -533,9 +647,44 @@ bool isPureNumber(const std::string& s) {
     return hasDigit;
 }
 
-// ---- º¯Êý¶¨Òå ----
+// ---- oˉêy?¨ò? ----
 struct Function { std::string name; std::vector<std::string> params; std::vector<std::string> body; };
 std::map<std::string, Function> g_funcs;
+
+// gc/getMemStats 实现 (所有全局变量已就绪)
+MemStats getMemStats() {
+    MemStats s;
+    s.vars = g_vars.size();
+    s.lists = g_lists.size();
+    s.dicts = g_dicts.size();
+    s.consts = g_consts.size();
+    s.funcs = g_funcs.size();
+    s.nativeFuncs = g_nativeFuncs.size();
+    s.loadedDlls = g_loadedDlls.size();
+    s.loadedPacks = g_loadedPacks.size();
+    s.pendingFrames = g_pendingFrames.size();
+    s.resumeStack = g_resumeStack.size();
+    s.errors = g_errors.size();
+    return s;
+}
+
+std::string gc(int mode) {
+    MemStats before = getMemStats();
+    if (mode == 1) clearErrors();
+    else if (mode == 2) { g_vars.clear(); g_lists.clear(); g_dicts.clear(); }
+    else if (mode == 3) {
+        g_vars.clear(); g_lists.clear(); g_dicts.clear();
+        g_consts.clear(); g_errors.clear();
+        g_pendingFrames.clear(); g_resumeStack.clear();
+    }
+    MemStats after = getMemStats();
+    char buf[512];
+    sprintf(buf, "[GC] Vars:%zu->%zu Lists:%zu->%zu Dicts:%zu->%zu Consts:%zu->%zu Funcs:%zu Errors:%zu->%zu Total:%zu->%zu",
+        before.vars, after.vars, before.lists, after.lists,
+        before.dicts, after.dicts, before.consts, after.consts,
+        after.funcs, before.errors, after.errors, before.total(), after.total());
+    return std::string(buf);
+}
 
 // ---- 前向声明 ----
 void runCode(const std::string& input);
@@ -544,8 +693,8 @@ std::string evalExpr(const std::string& expr);
 std::string callFunc(const std::string& name, const std::vector<std::string>& args);
 bool builtinCall(const std::string& name, const std::vector<std::string>& args, std::string& result);
 
-// ---- calc: ÍêÈ«ÖØÐ´£¬Ö§³ÖÀ¨ºÅ¡¢Ò»Ôª¸ººÅ¡¢¿ÆÑ§¼ÆÊý·¨ ----
-// Ê¹ÓÃÕ»Ê½¼ÆËã£¬×¼È·´¦ÀíÔËËã·ûÓÅÏÈ¼¶ºÍÀ¨ºÅ
+// ---- calc: íêè???D′￡??§3?à¨o??￠ò??a?oo??￠???§??êy·¨ ----
+// ê1ó???ê?????￡?×?è·′|àí????·?ó??è??oíà¨o?
 
 static bool findTopLevelOp(const std::string& s, char op1, char op2, size_t& outPos) {
     int depth = 0;
@@ -592,7 +741,7 @@ static bool findTopLevelMulDiv(const std::string& s, char op, size_t& outPos) {
     return false;
 }
 
-// ×Ó±í´ïÊ½ÖÐÊÇ·ñº¬×Ö·û´®ÁÐ£¨±ÜÃâ calc °Ñ×Ö·û´®×ª³É 0 Ôì³É×Ö·û´®±È½ÏÎóÅÐ£©
+// ×ó±í′?ê??Dê?·?o?×?·?′?áD￡¨±ü?a calc °?×?·?′?×a3é 0 ?ì3é×?·?′?±è???ó?D￡?
 static bool hasStringLiteral(const std::string& s) {
     for (size_t i = 0; i < s.size(); i++) {
         if (s[i] == '"' || s[i] == '\'') return true;
@@ -605,11 +754,11 @@ double calc(const std::string& e) {
     trim(s);
     if (s.empty()) return 0;
 
-    // Èôº¬×Ö·û´®ÁÐ£¬ËµÃ÷²»ÊÇ´¿ÊýÖµ±í´ïÊ½£¬·µ»Ø 0
-    // £¨×Ö·û´®±È½ÏÓ¦ÔÚ cond ÖÐµ¥¶À´¦Àí£©
+    // è?o?×?·?′?áD￡??μ?÷2?ê?′?êy?μ±í′?ê?￡?·μ?? 0
+    // ￡¨×?·?′?±è??ó|?ú cond ?Dμ￥?à′|àí￡?
     if (hasStringLiteral(s)) return 0;
 
-    // È¥³ýÍâ²ãÀ¨ºÅ
+    // è￥3yía2?à¨o?
     while (s.size() >= 2 && s[0] == '(' && s.back() == ')') {
         int depth = 0; bool isOuter = true;
         for (size_t i = 0; i < s.size(); i++) {
@@ -621,13 +770,13 @@ double calc(const std::string& e) {
     }
     if (s.empty()) return 0;
 
-    // ´¿Êý×Ö
+    // ′?êy×?
     if (isPureNumber(s)) return atof(s.c_str());
 
-    // ±äÁ¿
+    // ±?á?
     if (hasVar(s)) return atof(getVar(s).c_str());
 
-    // ²éÕÒ + / - £¨×îµÍÓÅÏÈ¼¶£©
+    // 2é?ò + / - ￡¨×?μíó??è??￡?
     size_t pos;
     if (findTopLevelOp(s, '+', '-', pos)) {
         char op = s[pos];
@@ -636,7 +785,7 @@ double calc(const std::string& e) {
         return op == '+' ? l + r : l - r;
     }
 
-    // ²éÕÒ * / £¨ÖÐ¼äÓÅÏÈ¼¶£©
+    // 2é?ò * / ￡¨?D??ó??è??￡?
     if (findTopLevelMulDiv(s, '*', pos)) {
         return calc(s.substr(0, pos)) * calc(s.substr(pos + 1));
     }
@@ -646,7 +795,7 @@ double calc(const std::string& e) {
         return calc(s.substr(0, pos)) / r;
     }
 
-    // Ò»Ôª¸ººÅ
+    // ò??a?oo?
     if (s.size() >= 2 && s[0] == '-') {
         return -calc(s.substr(1));
     }
@@ -654,19 +803,19 @@ double calc(const std::string& e) {
         return calc(s.substr(1));
     }
 
-    // ±äÁ¿
+    // ±?á?
     if (hasVar(s)) return atof(getVar(s).c_str());
     return atof(s.c_str());
 }
 
-// ---- cond: ÖØÐ´£¬Ö§³Ö×Ö·û´®±È½Ï¡¢ÕýÈ·Ìø¹ýÒýºÅ ----
-// ·µ»ØÖµ£º0 = false£¬1 = true£¬-1 = ÎÞ±È½Ï·ûºÅ
+// ---- cond: ??D′￡??§3?×?·?′?±è???￠?yè·ì?1yòyo? ----
+// ·μ???μ￡o0 = false￡?1 = true￡?-1 = ?T±è??·?o?
 static int tryCompare(const std::string& s, std::string& lhs, std::string& rhs, std::string& op) {
     std::string ops[] = {"==","!=",">=","<=",">","<"};
     for (int i = 0; i < 6; i++) {
         const std::string& o = ops[i];
         size_t p = std::string::npos;
-        // É¨ÃèÊ±Ìø¹ýÒýºÅÄÚµÄÄÚÈÝ
+        // é¨?èê±ì?1yòyo??úμ??úèY
         bool inS = false, inD = false;
         int depth = 0;
         for (size_t k = 0; k + o.size() <= s.size(); k++) {
@@ -678,9 +827,9 @@ static int tryCompare(const std::string& s, std::string& lhs, std::string& rhs, 
             if (c == '(') depth++;
             else if (c == ')') { if (depth > 0) depth--; }
 
-            // ´¦Àí >= <= != == ÐèÒªÌø¹ýµ¥×Ö·ûµÄ > <
+            // ′|àí >= <= != == Dèòaì?1yμ￥×?·?μ? > <
             if (o == ">" || o == "<") {
-                // ±ÜÃâ°Ñ >= µÄ > µ±³É > ÔËËã·û
+                // ±ü?a°? >= μ? > μ±3é > ????·?
                 if (c == o[0]) {
                     if (k + 1 < s.size() && s[k+1] == '=') { k++; continue; }
                     if (depth == 0) { p = k; break; }
@@ -701,15 +850,15 @@ static int tryCompare(const std::string& s, std::string& lhs, std::string& rhs, 
     return 0;
 }
 
-// ÅÐ¶Ï±í´ïÊ½ÊÇ·ñÊÇ×Ö·û´®ÀàÐÍ
+// ?D??±í′?ê?ê?·?ê?×?·?′?ààDí
 static bool isStringExpr(const std::string& s) {
     std::string t = s;
     trim(t);
     if (t.empty()) return false;
     if (t[0] == '"' || t[0] == '\'') return true;
-    // °üº¬×Ö·û´®Á¬½Ó
+    // °üo?×?·?′?á??ó
     if (t.find('"') != std::string::npos || t.find('\'') != std::string::npos) return true;
-    // ÒÑÖª×Ö·û´®±äÁ¿
+    // ò??a×?·?′?±?á?
     if (hasVar(t)) {
         const std::string& v = getVar(t);
         if (!isPureNumber(v)) return true;
@@ -725,7 +874,7 @@ bool cond(const std::string& c) {
     std::string lhs, rhs, op;
     if (tryCompare(s, lhs, rhs, op)) {
         trim(lhs); trim(rhs);
-        // Èç¹ûÁ½±ß¶¼ÊÇ×Ö·û´®ÀàÐÍ£¬×÷×Ö·û´®±È½Ï
+        // è?1?á?±???ê?×?·?′?ààDí￡?×÷×?·?′?±è??
         bool lIsStr = isStringExpr(lhs);
         bool rIsStr = isStringExpr(rhs);
         if (lIsStr || rIsStr) {
@@ -761,7 +910,7 @@ bool cond(const std::string& c) {
     return calc(s) != 0;
 }
 
-// ---- getArg: ÖØÐ´£¬ÕýÈ·´¦ÀíÒýºÅ×Ö·û´®¡¢ÔËËã·û¡¢×Ó²ÎÊý ----
+// ---- getArg: ??D′￡??yè·′|àíòyo?×?·?′??￠????·??￠×ó2?êy ----
 std::string getArg(const std::string& s, size_t& pos) {
     while (pos < s.size() && (s[pos] == ' ' || s[pos] == '\t')) pos++;
     if (pos >= s.size()) return "";
@@ -800,11 +949,23 @@ std::string getArg(const std::string& s, size_t& pos) {
     return rs;
 }
 
-// ---- callFunc: ÍêÈ«ÖØÐ´£¬ÍêÉÆ×÷ÓÃÓò¸ôÀë ----
+// ---- callFunc: íêè???D′￡?íêé?×÷ó?óò??à? ----
 std::string callFunc(const std::string& name, const std::vector<std::string>& args) {
     auto it = g_funcs.find(name);
     if (it == g_funcs.end()) return "";
+
+    // 递归深度检测 — 防止栈溢出
+    if (g_callDepth >= MAX_CALL_DEPTH) {
+        reportError(ERR_STACK_OVERFLOW, "call depth exceeded " + std::to_string(MAX_CALL_DEPTH), name);
+        return "";
+    }
+    g_callDepth++;
+
     Function& f = it->second;
+
+    // 保存当前函数名 (用于错误定位)
+    std::string savedFuncName = g_currentFuncName;
+    g_currentFuncName = name;
 
     // 保存调用前的完整全局变量状态，实现作用域隔离
     std::map<std::string, std::string> savedGlobalVars = g_vars;
@@ -829,14 +990,16 @@ std::string callFunc(const std::string& name, const std::vector<std::string>& ar
     g_returning = savedReturning;
     g_breakLoop = savedBreak;
     g_vars = savedGlobalVars;
+    g_currentFuncName = savedFuncName;
+    g_callDepth--;
 
     return ret;
 }
 
-// ---- evalExpr: ÍêÈ«ÖØÐ´ ----
-// Ö§³Ö£º×Ö·û´®×ÖÃæÁ¿¡¢±äÁ¿Ãû¡¢ÊýÖµ¼ÆËã¡¢×Ö·û´®Æ´½Ó¡¢º¯Êýµ÷ÓÃ¡¢À¨ºÅ
+// ---- evalExpr: íêè???D′ ----
+// ?§3?￡o×?·?′?×???á??￠±?á????￠êy?μ?????￠×?·?′??′?ó?￠oˉêyμ÷ó??￠à¨o?
 
-// ½âÎöÒýºÅ×Ö·û´®£¨È¥³ýÒýºÅ¡¢´¦Àí×ªÒå£©
+// ?a??òyo?×?·?′?￡¨è￥3yòyo??￠′|àí×aò?￡?
 static std::string parseStringLiteral(const std::string& s) {
     std::string r;
     for (size_t i = 1; i < s.size() - 1; i++) {
@@ -868,7 +1031,7 @@ static bool isQuoted(const std::string& s) {
     return false;
 }
 
-// Ñ°ÕÒ×îÍâ²ãÎ´Æ¥ÅäµÄ + £¨×Ö·û´®Æ´½Ó£©£¬Ìø¹ýÒýºÅÄÚµÄ +
+// ?°?ò×?ía2??′?￥??μ? + ￡¨×?·?′??′?ó￡?￡?ì?1yòyo??úμ? +
 static bool findConcatPlus(const std::string& s, size_t& outPos) {
     int depth = 0;
     bool inS = false, inD = false;
@@ -882,7 +1045,7 @@ static bool findConcatPlus(const std::string& s, size_t& outPos) {
         else if (c == '(') { depth--; continue; }
         if (depth != 0) continue;
         if (c == '+') {
-            // ·ÇÒ»ÔªºÅ£ºÇ°Ãæ·ÇÔËËã·û/×óÀ¨ºÅ
+            // ·?ò??ao?￡o?°??·?????·?/×óà¨o?
             if (i == 0) continue;
             char prev = s[i-1];
             if (prev == '(' || prev == '+' || prev == '-' || prev == '*' || prev == '/') continue;
@@ -893,7 +1056,7 @@ static bool findConcatPlus(const std::string& s, size_t& outPos) {
     return false;
 }
 
-// ½«±í´ïÊ½µÄÖµ×ªÎª×Ö·û´®ÐÎÊ½£¨Êý×Ö×ÔÈ»¸ñÊ½»¯£©
+// ??±í′?ê?μ??μ×a?a×?·?′?D?ê?￡¨êy×?×?è???ê??ˉ￡?
 static std::string numToStr(double val) {
     if (val == std::floor(val) && std::fabs(val) < 2e18) {
         char buf[64];
@@ -986,7 +1149,7 @@ std::string evalExpr(const std::string& expr) {
                 if (g_waitingInput) return "";  // callFunc 内部可能触发 Input
                 s.replace(pos, rp - pos + 1, fr);
                 replaced = true;
-                break; // ÖØÐÂ¿ªÊ¼Ìæ»»Ñ­»·
+                break; // ??D??aê?ì????-?·
             }
             if (replaced) break;
         }
@@ -1057,6 +1220,7 @@ std::string evalExpr(const std::string& expr) {
                 "listPop","listClear","listSort","listReverse","listFind","listContains",
                 "listCopy","listSum","listJoin","listPrint",
                 "abs","sqrt","pow","max","min","floor","ceil","round","random","mod","sin","cos","log",
+                "gc","memStats",
                 "CboxS","getCbox","isCbox","showAllCboxS",
                 "dictNew","dictSet","dictGet","dictHas","dictRemove","dictLen",
                 "dictClear","dictKeys","dictValues","dictCopy","dictPrint","dictMerge", NULL
@@ -1209,31 +1373,31 @@ std::string evalExpr(const std::string& expr) {
         }
     }
 
-    // ÊýÖµ¼ÆËã
+    // êy?μ????
     double val = calc(s);
     return numToStr(val);
 }
 
-// ---- resolveFuncArg: ²ÎÊý½âÎö ----
+// ---- resolveFuncArg: 2?êy?a?? ----
 std::string resolveFuncArg(const std::string& raw) {
     std::string s = raw;
     trim(s);
     if (s.empty()) return "";
     if (isQuoted(s)) return parseStringLiteral(s);
-    if (isIdentifier(s) && !hasVar(s)) return s; // Î´¶¨ÒåµÄ±êÊ¶·û×÷Îª×Ö·û´®
+    if (isIdentifier(s) && !hasVar(s)) return s; // ?′?¨ò?μ?±êê?·?×÷?a×?·?′?
     return evalExpr(s);
 }
 
-// ---- runCode: ÖØÐ´ ----
-// ´¦Àíµ¥ÐÐÖ¸Áî£ºreturn¡¢¸³Öµ¡¢¸´ºÏ¸³Öµ¡¢º¯Êýµ÷ÓÃ¡¢ËµÃ÷Óï¾ä
+// ---- runCode: ??D′ ----
+// ′|àíμ￥DD??á?￡oreturn?￠?3?μ?￠?′o??3?μ?￠oˉêyμ÷ó??￠?μ?÷ó???
 
-// ÅÐ¶Ï s ÊÇ·ñÒÔÍÆ¼öµÄÄ³ÖÖÖ¸Áî¿ªÍ·
+// ?D?? s ê?·?ò?í???μ??3????á??aí·
 static bool startsWith(const std::string& s, const std::string& p) {
     return s.size() >= p.size() && s.compare(0, p.size(), p) == 0;
 }
 
-// ÅÐ¶ÏÊÇ·ñÎª¼òµ¥¸³Öµ£¨·Ç¸´ºÏ¸³Öµ¡¢·Ç±È½ÏÔËËã·û£©
-// ·µ»Ø -1 ±íÊ¾·ñ£»·ñÔò·µ»Ø = µÄÎ»ÖÃ
+// ?D??ê?·??a?òμ￥?3?μ￡¨·??′o??3?μ?￠·?±è??????·?￡?
+// ·μ?? -1 ±íê?·?￡?·??ò·μ?? = μ?????
 static size_t findAssignEq(const std::string& s) {
     bool inS = false, inD = false;
     int depth = 0;       // () 深度
@@ -1659,6 +1823,25 @@ bool builtinCall(const std::string& name, const std::vector<std::string>& args, 
         return true;
     }
 
+    // ============ 内存管理 / GC ============
+
+    // gc(mode) - 资源清理/统计
+    // mode: 0=统计 1=清理错误 2=清理变量 3=全清理
+    if (name == "gc") {
+        int mode = args.empty() ? 0 : atoi(args[0].c_str());
+        result = gc(mode);
+        return true;
+    }
+    // memStats() - 返回当前资源统计
+    if (name == "memStats") {
+        MemStats s = getMemStats();
+        char buf[512];
+        sprintf(buf, "Vars:%zu Lists:%zu Dicts:%zu Consts:%zu Funcs:%zu Native:%zu DLLs:%zu Errors:%zu Total:%zu",
+            s.vars, s.lists, s.dicts, s.consts, s.funcs, s.nativeFuncs, s.loadedDlls, s.errors, s.total());
+        result = buf;
+        return true;
+    }
+
     // ============ 数学函数 (10+) ============
 
     // abs(n) - 绝对值
@@ -1909,7 +2092,7 @@ void runCode(const std::string& input) {
     trim(s);
     if (s.empty() || s[0] == '#') return;
 
-    // return Óï¾ä
+    // return ó???
     if (startsWith(s, "return ")) {
         std::string val = s.substr(7);
         trim(val);
@@ -1923,7 +2106,7 @@ void runCode(const std::string& input) {
         return;
     }
 
-    // ¼ì²â¸³Öµ£¨ÔÚº¯Êýµ÷ÓÃÖ®Ç°£©
+    // ?ì2a?3?μ￡¨?úoˉêyμ÷ó????°￡?
     size_t eqPos = findAssignEq(s);
     size_t parenPos = s.find('(');
 
@@ -1969,7 +2152,7 @@ void runCode(const std::string& input) {
         return;
     }
 
-    // º¯Êýµ÷ÓÃÓëËµÃ÷Óï¾ä£¨ÒÔ ( ½áÎ²£©
+    // oˉêyμ÷ó?ó??μ?÷ó???￡¨ò? ( ?á?2￡?
     if (parenPos != std::string::npos && s.back() == ')') {
         std::string fn = s.substr(0, parenPos);
         trim(fn);
@@ -1983,7 +2166,7 @@ void runCode(const std::string& input) {
             else if (pos >= s.size()) break;
         }
 
-        // ÓÃ»§º¯Êý
+        // ó??§oˉêy
         if (g_funcs.find(fn) != g_funcs.end()) {
             std::vector<std::string> args;
             for (size_t i = 0; i < rawArgs.size(); i++) {
@@ -2123,7 +2306,7 @@ void runCode(const std::string& input) {
         return;
     }
 
-    // ¸´ºÏ¸³Öµ += -= *= /=
+    // ?′o??3?μ += -= *= /=
     std::string ops[] = {"+=","-=","*=","/="};
     for (int j = 0; j < 4; j++) {
         size_t op = s.find(ops[j]);
@@ -2133,7 +2316,7 @@ void runCode(const std::string& input) {
             trim(vn); trim(rv);
             if (vn.empty() || rv.empty()) return;
             if (!hasVar(vn)) {
-                // Î´¶¨Òå±äÁ¿£¬³õÊ¼»¯Îª 0 ÔÙÔËËã
+                // ?′?¨ò?±?á?￡?3?ê??ˉ?a 0 ?ù????
                 setVar(vn, "0");
                 Log("[Warn] auto-init undefined variable: " + vn);
             }
@@ -2259,7 +2442,7 @@ void resumeWhileLoop(ResumeFrame& frame) {
     }
 }
 
-// ---- runLines: ÖØÐ´£¬ÕýÈ·´¦Àí¶ÌÂ·Ìø³öÓë return ----
+// ---- runLines: ??D′￡??yè·′|àí?ì?·ì?3?ó? return ----
 void runLines(const std::vector<std::string>& lines) {
     for (size_t i = 0; i < lines.size(); i++) {
         // Input 中断：保存剩余行为 SEQ 帧，然后返回
@@ -2305,6 +2488,72 @@ void runLines(const std::vector<std::string>& lines) {
                     loadCPack(packName);
                 }
             }
+            continue;
+        }
+
+        // Thread ... endThread - 启动新线程执行代码块
+        // 语法:
+        //   Thread
+        //     <并行执行的代码>
+        //   endThread
+        if (s == "Thread") {
+            std::vector<std::string> threadBody;
+            int depth = 0;
+            for (size_t j = i + 1; j < lines.size(); j++) {
+                std::string l = lines[j]; trim(l);
+                if (l == "endThread" && depth == 0) { i = j; break; }
+                if (startsWith(l, "Func(") || startsWith(l, "if(") ||
+                    startsWith(l, "For(") || startsWith(l, "while(") ||
+                    startsWith(l, "try") || startsWith(l, "Thread")) depth++;
+                if (l == "EndFunc" || l == "endif" || l == "endfor" || l == "endwhile" ||
+                    l == "endTry" || l == "endThread") depth--;
+                threadBody.push_back(lines[j]);
+                if (j == lines.size() - 1) i = j;
+            }
+            // 初始化锁 (仅一次)
+            if (!g_scriptCSInited) {
+                InitializeCriticalSection(&g_scriptCS);
+                g_scriptCSInited = true;
+            }
+            // 创建线程
+            ThreadArg* arg = new ThreadArg();
+            arg->lines = threadBody;
+            arg->threadId = (int)g_scriptThreads.size();
+            InterlockedIncrement(&g_threadCount);
+            DWORD tid;
+            HANDLE h = CreateThread(NULL, 0, scriptThreadFunc, arg, 0, &tid);
+            if (h) {
+                g_scriptThreads.push_back(h);
+                Log("[Thread] started #" + std::to_string(arg->threadId));
+            } else {
+                InterlockedDecrement(&g_threadCount);
+                delete arg;
+                Log("[Thread] failed to create");
+            }
+            continue;
+        }
+
+        // ThreadRun - 等待所有线程完成
+        if (s == "ThreadRun") {
+            Log("[ThreadRun] waiting for " + std::to_string(g_threadCount) + " threads...");
+            for (auto& h : g_scriptThreads) {
+                WaitForSingleObject(h, INFINITE);
+                CloseHandle(h);
+            }
+            g_scriptThreads.clear();
+            Log("[ThreadRun] all threads done");
+            continue;
+        }
+
+        // Lock - 获取锁 (线程同步)
+        if (s == "Lock") {
+            if (g_scriptCSInited) EnterCriticalSection(&g_scriptCS);
+            continue;
+        }
+
+        // Unlock - 释放锁
+        if (s == "Unlock") {
+            if (g_scriptCSInited) LeaveCriticalSection(&g_scriptCS);
             continue;
         }
 
@@ -2434,7 +2683,7 @@ void runLines(const std::vector<std::string>& lines) {
             bool isExprStep = false;
             if (fa.size() >= 4) {
                 std::string ss = fa[3]; trim(ss);
-                // Ö»ÓÐµ±ÕæÕýÊÇ±í´ïÊ½²Åµ±×÷±í´ïÊ½£¬·ñÔòÊÇ step
+                // ??óDμ±???yê?±í′?ê?2?μ±×÷±í′?ê?￡?·??òê? step
                 if (isPureNumber(ss)) step = (int)calc(ss);
                 else isExprStep = true;
             } else {
@@ -2474,7 +2723,7 @@ void runLines(const std::vector<std::string>& lines) {
                 runLines(fb);
                 if (g_returning) { g_breakLoop = savedBreak; return; }
                 if (g_waitingInput) {
-                    // Input ÖÐ¶Ï£º±£´æ For Ñ­»·¼ÌÐøÖ¡
+                    // Input ?D??￡o±￡′? For ?-?·?ìD???
                     ResumeFrame frame;
                     frame.type = 1;  // FOR
                     frame.forVar = var;
@@ -2483,7 +2732,7 @@ void runLines(const std::vector<std::string>& lines) {
                     frame.forEnd = end;
                     frame.forStep = step;
                     frame.forBody = fb;
-                    // ¼ÆËãÏÂÒ»¸öµü´úÖµ
+                    // ??????ò???μü′ú?μ
                     if (isExprStep) frame.forVal = (int)calc(fa[3]);
                     else frame.forVal = val + step;
                     g_pendingFrames.push_back(frame);
@@ -2524,7 +2773,7 @@ void runLines(const std::vector<std::string>& lines) {
                 runLines(wb);
                 if (g_returning) { g_breakLoop = savedBreak; return; }
                 if (g_waitingInput) {
-                    // Input ÖÐ¶Ï£º±£´æ while Ñ­»·¼ÌÐøÖ¡
+                    // Input ?D??￡o±￡′? while ?-?·?ìD???
                     ResumeFrame frame;
                     frame.type = 2;  // WHILE
                     frame.whileCond = cs;
@@ -2540,13 +2789,13 @@ void runLines(const std::vector<std::string>& lines) {
             continue;
         }
 
-        // break Óï¾ä
+        // break ó???
         if (s == "break") {
             g_breakLoop = true;
             return;
         }
 
-        // ÆÕÍ¨Ö¸Áî
+        // ??í¨??á?
         runCode(s);
         if (g_returning) return;
     }
@@ -2797,7 +3046,24 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             // 快捷键在消息循环中处理
             break;
         }
-        case WM_DESTROY: PostQuitMessage(0); break;
+        case WM_APP_RUNDONE: {
+            // 后台线程运行完成
+            if (g_hRunThread) { CloseHandle(g_hRunThread); g_hRunThread = NULL; }
+            if (g_waitingInput) {
+                flushPendingFrames();
+                setInputMode(true);
+            } else {
+                printAllErrors();
+                Log("=== Done ===");
+                setInputMode(false);
+            }
+            break;
+        }
+        case WM_DESTROY:
+            // 等待线程结束
+            if (g_hRunThread) { WaitForSingleObject(g_hRunThread, 2000); CloseHandle(g_hRunThread); }
+            if (g_csInited) DeleteCriticalSection(&g_cs);
+            PostQuitMessage(0); break;
     }
     return DefWindowProc(hWnd, msg, wParam, lParam);
 }
@@ -2823,12 +3089,33 @@ std::vector<std::string> readEditorLines() {
 }
 
 // 处理 Run 按钮
+// 后台运行线程函数
+DWORD WINAPI runThreadFunc(LPVOID lpParam) {
+    std::vector<std::string>* pls = (std::vector<std::string>*)lpParam;
+    std::vector<std::string> ls = *pls;
+    delete pls;
+
+    // 执行
+    runLines(ls);
+
+    // 通知主线程运行完成
+    PostMessage(g_hMainWnd, WM_APP_RUNDONE, 0, 0);
+    setRunning(false);
+    return 0;
+}
+
 void handleRun() {
     // 如果正在等待输入，交给发送按钮处理
     if (g_waitingInput) {
         handleSendInput();
         return;
     }
+    // 防止重复运行
+    if (isRunning()) {
+        Log("[Warn] program is already running");
+        return;
+    }
+
     std::vector<std::string> ls = readEditorLines();
     if (ls.empty()) {
         ensureOutputWindow();
@@ -2855,19 +3142,32 @@ void handleRun() {
     g_loadedDlls.clear();
     g_inputPending = false;
     g_inputResult.clear();
+    g_callDepth = 0;
+    g_currentFuncName.clear();
+    // 清理用户线程
+    for (auto& h : g_scriptThreads) { WaitForSingleObject(h, 1000); CloseHandle(h); }
+    g_scriptThreads.clear();
+    g_threadCount = 0;
+    // 初始化脚本线程锁
+    if (!g_scriptCSInited) { InitializeCriticalSection(&g_scriptCS); g_scriptCSInited = true; }
     clearErrors();
     g_currentLineNo = 0;
-    // 执行
-    runLines(ls);
-    if (g_waitingInput) {
-        flushPendingFrames();
-        // 启用输入框等待用户输入
-        setInputMode(true);
-    } else {
-        // 打印错误汇总
-        printAllErrors();
-        Log("=== Done ===");
-        setInputMode(false);
+
+    // 初始化临界区(仅一次)
+    if (!g_csInited) {
+        InitializeCriticalSection(&g_cs);
+        g_csInited = true;
+    }
+
+    setRunning(true);
+
+    // 创建后台线程执行 (不阻塞 UI)
+    std::vector<std::string>* pls = new std::vector<std::string>(ls);
+    DWORD threadId;
+    g_hRunThread = CreateThread(NULL, 0, runThreadFunc, pls, 0, &threadId);
+    if (!g_hRunThread) {
+        setRunning(false);
+        Log("[Error] failed to create thread");
     }
 }
 
@@ -3293,6 +3593,22 @@ const char* g_helpText =
 "    }\r\n"
 "  手动编译DLL: g++ -shared -o cpacks/fastmath.dll cpacks/fastmath.cpp\r\n"
 "\r\n"
+"【多线程】\r\n"
+"  Thread ... endThread  ' 启动新线程并行执行\r\n"
+"  ThreadRun             ' 等待所有线程完成\r\n"
+"  Lock                  ' 获取锁 (线程同步)\r\n"
+"  Unlock                ' 释放锁\r\n"
+"  示例:\r\n"
+"    Thread\r\n"
+"      PrintLog(\"thread 1\")\r\n"
+"    endThread\r\n"
+"    Thread\r\n"
+"      PrintLog(\"thread 2\")\r\n"
+"    endThread\r\n"
+"    ThreadRun\r\n"
+"    PrintLog(\"all done\")\r\n"
+"  注意: 线程共享全局变量,用Lock/Unlock保护\r\n"
+"\r\n"
 "【文件操作】\r\n"
 "  Save - 输入文件路径(如 test.sal), 保存代码\r\n"
 "  Open - 输入文件路径, 加载代码\r\n"
@@ -3474,6 +3790,7 @@ static const char* g_keywords[] = {
     "box","boxS","CboxS","getCbox","isCbox","showAllCboxS",
     "GetPack",
     "GetCPack",
+    "Thread","endThread","ThreadRun","Lock","Unlock",
     NULL
 };
 
@@ -3697,16 +4014,22 @@ void handleSendInput() {
     // 暂时禁用输入框（恢复执行期间不接收输入）
     setInputMode(false);
 
-    // 恢复执行
+    // 恢复执行 — 在工作线程中继续
+    // 创建新线程恢复执行 (因为原工作线程在 resumeExecution 返回后已结束)
     flushPendingFrames();
-    resumeExecution();
+    setRunning(true);
 
-    if (g_waitingInput) {
-        // 又遇到 Input，继续等待
-        setInputMode(true);
-    } else {
-        Log("=== Done ===");
-        setInputMode(false);
+    DWORD threadId;
+    g_hRunThread = CreateThread(NULL, 0, [](LPVOID) -> DWORD {
+        resumeExecution();
+        PostMessage(g_hMainWnd, WM_APP_RUNDONE, 0, 0);
+        setRunning(false);
+        return 0;
+    }, NULL, 0, &threadId);
+
+    if (!g_hRunThread) {
+        setRunning(false);
+        Log("[Error] failed to create resume thread");
     }
 }
 
